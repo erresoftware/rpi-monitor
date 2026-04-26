@@ -7,7 +7,7 @@ echo “”
 
 # Check if running on Raspberry Pi
 
-if ! grep -q “Raspberry” /proc/device-tree/model 2>/dev/null; then
+if ! cat /proc/device-tree/model 2>/dev/null | tr -d '\0' | grep -q "Raspberry"; then
 echo “ERROR: This script only works on Raspberry Pi!”
 exit 1
 fi
