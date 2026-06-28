@@ -14,7 +14,9 @@ It displays system information such as CPU temperature, load, memory, disk usage
 * Network usage per interface
 * Top processes by CPU usage
 * System uptime and OS information
-* Remote reboot and shutdown (password protected)
+* Available package update count and package list
+* Package index refresh
+* Single-package upgrade or full system package upgrade
 * Auto-refresh dashboard (web UI)
 
 ---
@@ -64,9 +66,12 @@ hostname -I
 
 ## 🔐 Security
 
-Reboot and shutdown actions require the system sudo password.
+Package refresh and upgrade actions require the system sudo password.
+The dashboard does not expose reboot or shutdown actions.
 
-⚠️ Keep your Raspberry Pi in a secure network.
+Keep your Raspberry Pi in a secure network. Do not expose this dashboard directly
+to the internet; use a VPN or a reverse proxy with TLS and authentication if you
+need remote access.
 
 ---
 
@@ -77,6 +82,7 @@ The server collects system data using Linux commands:
 * `/proc`
 * `vcgencmd`
 * `df`, `free`, `uptime`, `ps`
+* `apt list --upgradable`
 
 and exposes them via a Node.js Express server.
 
