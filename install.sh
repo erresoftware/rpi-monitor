@@ -13,12 +13,12 @@ if ! cat /proc/device-tree/model 2>/dev/null | tr -d '\0' | grep -q "Raspberry";
 fi
 
 # Update system
-echo "[1/5] Updating system..."
+echo "[1/6] Updating system..."
 export DEBIAN_FRONTEND=noninteractive
 sudo apt update -qq
 
 # Install Node.js if not present
-echo "[2/5] Checking Node.js..."
+echo "[2/6] Checking Node.js..."
 if ! command -v node &> /dev/null; then
   echo "Installing Node.js..."
   curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - -qq
@@ -26,14 +26,76 @@ if ! command -v node &> /dev/null; then
 fi
 
 # Install PM2 if not present
-echo "[3/5] Checking PM2..."
+echo "[3/6] Checking PM2..."
 if ! command -v pm2 &> /dev/null; then
   echo "Installing PM2..."
   sudo npm install -g pm2 -q
 fi
 
+# Configure restricted passwordless package updater
+echo "[4/6] Configuring package update permissions..."
+MONITOR_USER="$(id -un)"
+if ! printf '%s' "$MONITOR_USER" | grep -Eq '^[A-Za-z0-9_.-]+$'; then
+  echo "ERROR: Unsupported username for sudoers: $MONITOR_USER"
+  exit 1
+fi
+
+sudo tee /usr/local/sbin/rpi-monitor-apt > /dev/null <<'SH'
+#!/bin/sh
+set -eu
+
+export DEBIAN_FRONTEND=noninteractive
+export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+APT=/usr/bin/apt
+APT_GET=/usr/bin/apt-get
+PACKAGE_RE='^[A-Za-z0-9][A-Za-z0-9+.-]*(:[A-Za-z0-9]+)?$'
+
+is_upgradable() {
+  "$APT" list --upgradable 2>/dev/null | awk -F/ 'NR > 1 { print $1 }' | grep -Fx -- "$1" >/dev/null 2>&1
+}
+
+case "${1:-}" in
+  list)
+    exec "$APT" list --upgradable
+    ;;
+  refresh)
+    exec "$APT_GET" update
+    ;;
+  upgrade-all)
+    exec "$APT_GET" upgrade -y \
+      -o Dpkg::Options::=--force-confdef \
+      -o Dpkg::Options::=--force-confold
+    ;;
+  upgrade-one)
+    package="${2:-}"
+    if [ "$#" -ne 2 ] || ! printf '%s' "$package" | grep -Eq "$PACKAGE_RE"; then
+      echo "Invalid package name" >&2
+      exit 2
+    fi
+    if ! is_upgradable "$package"; then
+      echo "Package is not currently listed as upgradable" >&2
+      exit 3
+    fi
+    exec "$APT_GET" install -y --only-upgrade \
+      -o Dpkg::Options::=--force-confdef \
+      -o Dpkg::Options::=--force-confold \
+      "$package"
+    ;;
+  *)
+    echo "Usage: rpi-monitor-apt list|refresh|upgrade-all|upgrade-one <package>" >&2
+    exit 2
+    ;;
+esac
+SH
+sudo chmod 0755 /usr/local/sbin/rpi-monitor-apt
+printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/rpi-monitor-apt *\n' "$MONITOR_USER" | sudo tee /etc/sudoers.d/rpi-monitor > /dev/null
+sudo chmod 0440 /etc/sudoers.d/rpi-monitor
+sudo visudo -cf /etc/sudoers.d/rpi-monitor > /dev/null
+
 # Create folder and server file
-echo "[4/5] Creating monitor server..."
+echo "[5/6] Creating monitor server..."
 MONITOR_DIR="$HOME/rpi-monitor"
 mkdir -p "$MONITOR_DIR"
 cd "$MONITOR_DIR"
@@ -48,11 +110,9 @@ const { execFileSync, spawnSync } = require("child_process");
 const app = express();
 const PORT = Number(process.env.PORT || 3002);
 const APT_PACKAGE_RE = /^[A-Za-z0-9][A-Za-z0-9+.-]*(?::[A-Za-z0-9]+)?$/;
-const APT_YES_OPTIONS = [
-  "-y",
-  "-o", "Dpkg::Options::=--force-confdef",
-  "-o", "Dpkg::Options::=--force-confold"
-];
+const APT = "/usr/bin/apt";
+const SUDO = "/usr/bin/sudo";
+const APT_HELPER = "/usr/local/sbin/rpi-monitor-apt";
 
 app.disable("x-powered-by");
 app.use((req, res, next) => {
@@ -79,7 +139,11 @@ function run(cmd, args = [], options = {}) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: options.timeout || 5000,
-      maxBuffer: options.maxBuffer || 1024 * 256
+      maxBuffer: options.maxBuffer || 1024 * 256,
+      env: {
+        ...process.env,
+        LC_ALL: "C"
+      }
     }).trim();
   } catch (e) {
     return options.fallback || "N/A";
@@ -128,7 +192,7 @@ function parseOsRelease() {
 }
 
 function getAvailableUpdates() {
-  const output = run("apt", ["list", "--upgradable"], {
+  const output = run(APT, ["list", "--upgradable"], {
     timeout: 15000,
     maxBuffer: 1024 * 1024,
     fallback: ""
@@ -240,33 +304,16 @@ function getData() {
 app.get('/api', (req, res) => res.json(getData()));
 app.get('/api/updates', (req, res) => res.json({ ok: true, packages: getAvailableUpdates() }));
 
-function requirePassword(req) {
-  const password = req.body && req.body.password;
-  if (typeof password !== "string" || password.length === 0) {
-    const error = new Error("Password required");
-    error.status = 400;
-    throw error;
-  }
-  if (password.length > 256) {
-    const error = new Error("Password is too long");
-    error.status = 400;
-    throw error;
-  }
-  return password;
-}
-
 function cleanAptOutput(output) {
   return String(output || "")
-    .replace(/\[sudo\] password.*\n?/gi, "")
     .split("\n")
     .slice(-80)
     .join("\n")
     .trim();
 }
 
-function runSudoApt(password, args, timeout = 10 * 60 * 1000) {
-  const result = spawnSync("sudo", ["-S", "-p", "", "apt-get", ...args], {
-    input: `${password}\n`,
+function runAptHelper(args, timeout = 10 * 60 * 1000) {
+  const result = spawnSync(SUDO, ["-n", APT_HELPER, ...args], {
     encoding: "utf8",
     timeout,
     maxBuffer: 1024 * 1024,
@@ -286,7 +333,7 @@ function runSudoApt(password, args, timeout = 10 * 60 * 1000) {
   if (result.status !== 0) {
     const message = cleanAptOutput(result.stderr) || cleanAptOutput(result.stdout) || "apt-get failed";
     const error = new Error(message);
-    error.status = /sorry|password|authentication/i.test(message) ? 403 : 500;
+    error.status = /password|authentication|sudo/i.test(message) ? 403 : 500;
     throw error;
   }
 
@@ -306,8 +353,7 @@ function sendAptError(res, error) {
 
 app.post('/api/updates/refresh', (req, res) => {
   try {
-    const password = requirePassword(req);
-    const result = runSudoApt(password, ["update"]);
+    const result = runAptHelper(["refresh"]);
     const packages = getAvailableUpdates();
     res.json({ ok: true, updates: packages.length, packages, output: result.stdout || result.stderr });
   } catch (error) {
@@ -317,12 +363,11 @@ app.post('/api/updates/refresh', (req, res) => {
 
 app.post('/api/updates/install', (req, res) => {
   try {
-    const password = requirePassword(req);
     const packageName = req.body && req.body.package;
     const updateAll = Boolean(req.body && req.body.all);
 
     if (updateAll) {
-      const result = runSudoApt(password, ["upgrade", ...APT_YES_OPTIONS], 30 * 60 * 1000);
+      const result = runAptHelper(["upgrade-all"], 30 * 60 * 1000);
       const packages = getAvailableUpdates();
       return res.json({ ok: true, updates: packages.length, packages, output: result.stdout || result.stderr });
     }
@@ -336,7 +381,7 @@ app.post('/api/updates/install', (req, res) => {
       return res.status(404).json({ ok: false, error: "Package is not currently listed as upgradable" });
     }
 
-    const result = runSudoApt(password, ["install", ...APT_YES_OPTIONS, "--only-upgrade", packageName], 20 * 60 * 1000);
+    const result = runAptHelper(["upgrade-one", packageName], 20 * 60 * 1000);
     const packages = getAvailableUpdates();
     res.json({ ok: true, updates: packages.length, packages, output: result.stdout || result.stderr });
   } catch (error) {
@@ -367,7 +412,7 @@ app.get('/', (req, res) => {
         '<tr><td><div style="font-weight:600;word-break:break-word">' + escapeHtml(pkg.name) + '</div><div style="color:#8a8680;font-size:0.85em">' + escapeHtml(pkg.arch) + '</div></td><td>' + escapeHtml(pkg.current) + '</td><td>' + escapeHtml(pkg.candidate) + '</td><td><button class="btn btn-small" data-package="' + escapeAttr(pkg.name) + '" onclick="askUpdate(\'package\', this.dataset.package)">Update</button></td></tr>'
       ).join('');
 
-  const html = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="60"><title>Raspberry Monitor</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f4f0;color:#1a1916;padding:32px}header{margin-bottom:32px;border-bottom:2px solid #2c3e50;padding-bottom:16px}h1{font-size:1.6em;font-weight:700}.subtitle{font-family:"SFMono-Regular",Consolas,monospace;font-size:0.8em;color:#8a8680;margin-top:4px;line-height:1.5}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;margin-bottom:16px}.card{background:#fff;border:1px solid #e0ddd6;border-radius:8px;padding:20px}.card-wide{grid-column:1/-1}.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:12px}.label{font-size:0.7em;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#8a8680;margin-bottom:8px}.value{font-family:"SFMono-Regular",Consolas,monospace;font-size:2em;font-weight:700;line-height:1}.bar-bg{background:#e0ddd6;border-radius:4px;height:8px;margin-top:12px;overflow:hidden}.bar{height:100%;border-radius:4px}.bar-labels{display:flex;justify-content:space-between;gap:12px;font-family:"SFMono-Regular",Consolas,monospace;font-size:0.7em;color:#8a8680;margin-top:6px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}.table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;font-family:"SFMono-Regular",Consolas,monospace;font-size:0.8em;table-layout:fixed}th{text-align:left;padding:8px 12px;background:#f5f4f0;color:#8a8680;font-weight:700;font-size:0.75em;letter-spacing:0.06em;text-transform:uppercase}td{padding:8px 12px;border-bottom:1px solid #e0ddd6;vertical-align:middle;overflow-wrap:anywhere}tr:last-child td{border-bottom:none}.empty{color:#2d6a4f;font-weight:700;text-align:center}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btn{font-family:"SFMono-Regular",Consolas,monospace;font-size:0.8em;padding:8px 14px;border:1px solid #2c3e50;background:#2c3e50;color:#fff;border-radius:4px;cursor:pointer;min-height:34px}.btn:hover{filter:brightness(1.08)}.btn:disabled{opacity:.45;cursor:not-allowed}.btn-secondary{background:#fff;color:#2c3e50}.btn-small{padding:6px 10px;min-height:30px}.status{font-family:"SFMono-Regular",Consolas,monospace;font-size:0.75em;color:#8a8680;min-height:18px;margin-top:10px;white-space:pre-wrap}.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;padding:16px}.modal.show{display:flex}.modal-box{background:#fff;padding:28px;border-radius:8px;width:min(360px,100%)}.modal-box h2{margin-bottom:16px;font-size:1.2em}.modal-box input{width:100%;padding:10px;border:1px solid #d2cec5;border-radius:4px;font-family:"SFMono-Regular",Consolas,monospace;margin-bottom:16px;font-size:1em}.modal-actions{display:flex;gap:8px;justify-content:flex-end}@media(max-width:640px){body{padding:18px}.card-head{display:block}.actions{margin-top:12px}.value{font-size:1.65em}table{min-width:560px}}</style></head><body>'
+  const html = '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="refresh" content="60"><title>Raspberry Monitor</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f4f0;color:#1a1916;padding:32px}header{margin-bottom:32px;border-bottom:2px solid #2c3e50;padding-bottom:16px}h1{font-size:1.6em;font-weight:700}.subtitle{font-family:"SFMono-Regular",Consolas,monospace;font-size:0.8em;color:#8a8680;margin-top:4px;line-height:1.5}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;margin-bottom:16px}.card{background:#fff;border:1px solid #e0ddd6;border-radius:8px;padding:20px}.card-wide{grid-column:1/-1}.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:12px}.label{font-size:0.7em;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#8a8680;margin-bottom:8px}.value{font-family:"SFMono-Regular",Consolas,monospace;font-size:2em;font-weight:700;line-height:1}.bar-bg{background:#e0ddd6;border-radius:4px;height:8px;margin-top:12px;overflow:hidden}.bar{height:100%;border-radius:4px}.bar-labels{display:flex;justify-content:space-between;gap:12px;font-family:"SFMono-Regular",Consolas,monospace;font-size:0.7em;color:#8a8680;margin-top:6px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}.table-wrap{width:100%;overflow-x:auto}table{width:100%;border-collapse:collapse;font-family:"SFMono-Regular",Consolas,monospace;font-size:0.8em;table-layout:fixed}th{text-align:left;padding:8px 12px;background:#f5f4f0;color:#8a8680;font-weight:700;font-size:0.75em;letter-spacing:0.06em;text-transform:uppercase}td{padding:8px 12px;border-bottom:1px solid #e0ddd6;vertical-align:middle;overflow-wrap:anywhere}tr:last-child td{border-bottom:none}.empty{color:#2d6a4f;font-weight:700;text-align:center}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btn{font-family:"SFMono-Regular",Consolas,monospace;font-size:0.8em;padding:8px 14px;border:1px solid #2c3e50;background:#2c3e50;color:#fff;border-radius:4px;cursor:pointer;min-height:34px}.btn:hover{filter:brightness(1.08)}.btn:disabled{opacity:.45;cursor:not-allowed}.btn-secondary{background:#fff;color:#2c3e50}.btn-small{padding:6px 10px;min-height:30px}.status{font-family:"SFMono-Regular",Consolas,monospace;font-size:0.75em;color:#8a8680;min-height:18px;margin-top:10px;white-space:pre-wrap}@media(max-width:640px){body{padding:18px}.card-head{display:block}.actions{margin-top:12px}.value{font-size:1.65em}table{min-width:560px}}</style></head><body>'
   + '<header><h1>' + escapeHtml(d.model) + '</h1><div class="subtitle">' + escapeHtml(d.os) + ' &nbsp;·&nbsp; Kernel ' + escapeHtml(d.kernel) + ' &nbsp;·&nbsp; ' + escapeHtml(d.uptime) + ' &nbsp;·&nbsp; IP ' + escapeHtml(d.ip) + '</div></header>'
   + '<div class="grid">'
   + '<div class="card"><div class="label">CPU Temperature</div><div class="value" style="color:' + tempColor + '">' + escapeHtml(d.temp_c === null ? 'N/A' : d.temp_c + '°C') + '</div><div style="font-size:0.8em;color:' + (d.throttled?'#2d6a4f':'#c0392b') + ';margin-top:8px;font-family:SFMono-Regular,Consolas,monospace">' + escapeHtml(d.throttled_status === "N/A" ? "Throttling N/A" : d.throttled ? "No throttling" : "Throttling active") + '</div></div>'
@@ -376,14 +421,13 @@ app.get('/', (req, res) => {
   + '<div class="card"><div class="label">Available Updates</div><div class="value" style="color:' + updColor + '">' + escapeHtml(d.updates) + '</div></div>'
   + '<div class="card"><div class="label">RAM Memory</div><div class="value">' + escapeHtml(d.memory.pct) + '</div><div class="bar-bg"><div class="bar" style="width:' + escapeAttr(d.memory.pct) + ';background:' + memColor + '"></div></div><div class="bar-labels"><span>' + escapeHtml(d.memory.used_mb) + ' MB used</span><span>' + escapeHtml(d.memory.total_mb) + ' MB total</span></div></div>'
   + '<div class="card"><div class="label">Disk</div><div class="value">' + escapeHtml(d.disk.pct) + '</div><div class="bar-bg"><div class="bar" style="width:' + escapeAttr(d.disk.pct) + ';background:' + diskColor + '"></div></div><div class="bar-labels"><span>' + escapeHtml(d.disk.used) + ' used</span><span>' + escapeHtml(d.disk.total) + ' total</span></div></div>'
-  + '<div class="card card-wide"><div class="card-head"><div><div class="label">Package Updates</div><div class="value" style="color:' + updColor + '">' + escapeHtml(d.updates) + '</div></div><div class="actions"><button class="btn btn-secondary" onclick="askUpdate(\'refresh\')">Refresh list</button><button class="btn" onclick="askUpdate(\'all\')" ' + (d.updates === 0 ? 'disabled' : '') + '>Update all</button></div></div><div class="table-wrap"><table><colgroup><col style="width:40%"><col style="width:24%"><col style="width:24%"><col style="width:12%"></colgroup><thead><tr><th>Package</th><th>Current</th><th>New</th><th>Action</th></tr></thead><tbody>' + updateRows + '</tbody></table></div><div class="status" id="update-status"></div></div>'
+  + '<div class="card card-wide"><div class="card-head"><div><div class="label">Package Updates</div><div class="value" style="color:' + updColor + '">' + escapeHtml(d.updates) + '</div></div><div class="actions"><button class="btn btn-secondary" onclick="askUpdate(\'refresh\')">Refresh list</button><button class="btn" onclick="askUpdate(\'all\')" data-disabled="' + (d.updates === 0 ? 'true' : 'false') + '" ' + (d.updates === 0 ? 'disabled' : '') + '>Update all</button></div></div><div class="table-wrap"><table><colgroup><col style="width:40%"><col style="width:24%"><col style="width:24%"><col style="width:12%"></colgroup><thead><tr><th>Package</th><th>Current</th><th>New</th><th>Action</th></tr></thead><tbody>' + updateRows + '</tbody></table></div><div class="status" id="update-status"></div></div>'
   + '</div>'
   + '<div class="grid">'
   + '<div class="card"><div class="label">Network (session total)</div><div class="table-wrap"><table><thead><tr><th>Interface</th><th>Received</th><th>Sent</th></tr></thead><tbody>' + netRows + '</tbody></table></div><div style="font-family:SFMono-Regular,Consolas,monospace;font-size:0.75em;color:#8a8680;margin-top:12px">' + escapeHtml(d.connTCP) + '</div></div>'
   + '</div>'
   + '<div class="card"><div class="label" style="margin-bottom:16px">Processes</div><div class="table-wrap"><table><colgroup><col style="width:60%"><col style="width:20%"><col style="width:20%"></colgroup><thead><tr><th><div>User</div><div style="font-weight:400;font-size:0.85em;color:#8a8680">Process</div></th><th>CPU</th><th>Mem</th></tr></thead><tbody>' + procRows + '</tbody></table></div></div>'
-  + '<div class="modal" id="modal"><div class="modal-box"><h2 id="modal-title">Confirm update</h2><input type="password" id="modal-pwd" placeholder="Sudo password" autocomplete="current-password" /><div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal()">Cancel</button><button class="btn" id="modal-confirm" onclick="sendUpdate()">Confirm</button></div></div></div>'
-  + '<script>const state={action:"",packageName:""};function setStatus(text){const el=document.getElementById("update-status");if(el)el.textContent=text||"";}function askUpdate(action,packageName){state.action=action;state.packageName=packageName||"";const title=action==="refresh"?"Refresh package list":action==="all"?"Update all packages":"Update "+state.packageName;document.getElementById("modal-title").textContent=title;document.getElementById("modal-pwd").value="";document.getElementById("modal").classList.add("show");setTimeout(()=>document.getElementById("modal-pwd").focus(),100);}function closeModal(){document.getElementById("modal").classList.remove("show");}async function sendUpdate(){const password=document.getElementById("modal-pwd").value;if(!password)return;const confirm=document.getElementById("modal-confirm");confirm.disabled=true;setStatus("Working...");try{const refresh=state.action==="refresh";const body=refresh?{password}:{password,all:state.action==="all",package:state.packageName};const response=await fetch(refresh?"/api/updates/refresh":"/api/updates/install",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const data=await response.json().catch(()=>({error:"Invalid server response"}));if(!response.ok||!data.ok)throw new Error(data.error||"Update failed");closeModal();setStatus("Done. Reloading...");window.location.reload();}catch(error){setStatus("Error: "+error.message);}finally{confirm.disabled=false;}}</script>'
+  + '<script>let working=false;function setStatus(text){const el=document.getElementById("update-status");if(el)el.textContent=text||"";}function setBusy(busy){working=busy;document.querySelectorAll("button").forEach(btn=>{if(btn.textContent.includes("Update")||btn.textContent.includes("Refresh"))btn.disabled=busy||btn.dataset.disabled==="true";});}async function askUpdate(action,packageName){if(working)return;if(action==="all"&&!confirm("Update all packages?"))return;if(action==="package"&&!confirm("Update "+packageName+"?"))return;setBusy(true);setStatus("Working...");try{const refresh=action==="refresh";const body=refresh?{}:{all:action==="all",package:packageName};const response=await fetch(refresh?"/api/updates/refresh":"/api/updates/install",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const data=await response.json().catch(()=>({error:"Invalid server response"}));if(!response.ok||!data.ok)throw new Error(data.error||"Update failed");setStatus("Done. Reloading...");window.location.reload();}catch(error){setStatus("Error: "+error.message);setBusy(false);}}</script>'
   + '</body></html>';
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -396,7 +440,7 @@ app.listen(PORT, () => {
 JSEOF
 
 # Start with PM2
-echo "[5/5] Starting and configuring autostart..."
+echo "[6/6] Starting and configuring autostart..."
 if pm2 describe rpi-monitor > /dev/null 2>&1; then
   pm2 restart rpi-monitor --update-env > /dev/null 2>&1
 else
