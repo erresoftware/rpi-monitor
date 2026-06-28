@@ -42,6 +42,7 @@ The script will automatically:
 * Update system packages
 * Install Node.js (if missing)
 * Install PM2
+* Configure restricted passwordless package update permissions
 * Create the server
 * Configure autostart
 * Start the service
@@ -66,7 +67,9 @@ hostname -I
 
 ## 🔐 Security
 
-Package refresh and upgrade actions require the system sudo password.
+Package refresh and upgrade actions do not ask for a password in the web UI.
+The installer creates a restricted `sudo` rule that only allows the monitor user
+to run the package-update helper at `/usr/local/sbin/rpi-monitor-apt`.
 The dashboard does not expose reboot or shutdown actions.
 
 Keep your Raspberry Pi in a secure network. Do not expose this dashboard directly
